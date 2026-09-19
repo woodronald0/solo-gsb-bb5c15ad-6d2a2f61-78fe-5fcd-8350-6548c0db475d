@@ -1,0 +1,16 @@
+services:
+  argument-sandbox:
+    build: .
+    image: argument-stability-sandbox:latest
+    container_name: argument-stability-sandbox
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      PORT: 8080
+      DATABASE_PATH: /app/data/argument.db
+    volumes:
+      - argument-sqlite-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  argument-sqlite-data:
