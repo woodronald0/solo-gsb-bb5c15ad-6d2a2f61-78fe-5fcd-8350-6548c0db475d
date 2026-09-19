@@ -12,6 +12,8 @@ export interface ArgumentNodeData {
   /** 相对上一轮的升降（第 0 轮为空） */
   roundDelta?: number;
   inCycle?: boolean;
+  /** 是否位于当前选中的影响路径上 */
+  inPath?: boolean;
   [key: string]: unknown;
 }
 
@@ -30,6 +32,7 @@ export function ArgumentNode({ data, selected }: NodeProps<ArgumentNodeData>) {
         `kind-${data.kind}`,
         selected ? 'selected' : '',
         data.inCycle ? 'in-cycle' : '',
+        data.inPath ? 'in-path' : '',
         data.anchored ? 'anchored' : ''
       ].join(' ')}
       style={colors ? { backgroundImage: `linear-gradient(${colors.tint}, ${colors.tint})` } : undefined}

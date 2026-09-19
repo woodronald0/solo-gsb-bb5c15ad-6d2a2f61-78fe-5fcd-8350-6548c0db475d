@@ -1,5 +1,6 @@
 import type {
   GraphDocument,
+  PathTraceResult,
   PropagateOptions,
   PropagateResult,
   SensitivityResult
@@ -35,6 +36,17 @@ export const api = {
     samples?: number;
   }) =>
     request<{ scan: SensitivityResult }>('/api/sensitivity/edge-weight', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    }),
+  /** 影响路径追踪：提交当前画布图，仅在服务端内存中枚举路径，不会保存图。 */
+  tracePaths: (payload: {
+    graph: GraphDocument;
+    sourceNodeId: string;
+    targetNodeId: string;
+    maxHops?: number;
+  }) =>
+    request<{ trace: PathTraceResult }>('/api/paths/trace', {
       method: 'POST',
       body: JSON.stringify(payload)
     })

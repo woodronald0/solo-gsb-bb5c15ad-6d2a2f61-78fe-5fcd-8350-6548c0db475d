@@ -1,14 +1,18 @@
+import { Fragment } from 'react';
 import type { Edge, Node } from 'reactflow';
 import type { ArgumentNodeData } from './ArgumentNode';
 import type { RoundDecomposition } from '../replay';
 import { SensitivityChart } from './SensitivityChart';
-import type {
-  GraphDocument,
-  NodeKind,
-  PropagateOptions,
-  PropagateResult,
-  SensitivityResult,
-  Stance
+import {
+  MAX_PATH_HOPS,
+  type GraphDocument,
+  type ImpactPath,
+  type NodeKind,
+  type PathTraceResult,
+  type PropagateOptions,
+  type PropagateResult,
+  type SensitivityResult,
+  type Stance
 } from '../../../shared/graph';
 
 export interface SelectionState {
@@ -19,6 +23,12 @@ export interface SelectionState {
 export interface SensitivitySelection {
   edgeId: string;
   targetNodeId: string;
+}
+
+export interface PathTraceSelection {
+  sourceNodeId: string;
+  targetNodeId: string;
+  maxHops: number;
 }
 
 interface SidePanelProps {
@@ -40,6 +50,17 @@ interface SidePanelProps {
     onClose: () => void;
     edgeLabel: string;
     targetLabel: string;
+  };
+  pathTrace: {
+    selection: PathTraceSelection;
+    onSelectionChange: (patch: Partial<PathTraceSelection>) => void;
+    trace: PathTraceResult | null;
+    tracing: boolean;
+    status: string;
+    activePathIndex: number | null;
+    onSelectPath: (index: number | null) => void;
+    onRun: () => void;
+    onClose: () => void;
   };
   nodes: Node<ArgumentNodeData>[];
   edges: Edge[];
@@ -172,6 +193,7 @@ export function SidePanel({
   onUpdateEdge,
   onDeleteSelection,
   sensitivity,
+  pathTrace,
   nodes,
   edges
 }: SidePanelProps) {
@@ -292,6 +314,8 @@ export function SidePanel({
         stanceText={stanceText}
       />
 
+      <PathTraceCard pathTrace={pathTrace} nodes={nodes} nodeLabelById={nodeLabelById} stanceText={stanceText} />
+
       {decomposition && selection.node && <DecompositionCard decomposition={decomposition} />}
 
       {result && (
@@ -408,6 +432,178 @@ function SensitivityCard({ sensitivity, nodes, edges, nodeLabelById, stanceText 
         </>
       )}
     </section>
+  );
+}
+
+type PathTraceCardProps = Pick<SidePanelProps, 'pathTrace' | 'nodes'> & {
+  nodeLabelById: Map<string, string>;
+  stanceText: (stance: Stance) => string;
+};
+
+/** 影响路径追踪卡片：选择起始证据与目标节点，枚举 ≤8 跳的有向路径并展示绝对影响最大的前 3 条。 */
+function PathTraceCard({ pathTrace, nodes, nodeLabelById, stanceText }: PathTraceCardProps) {
+  const {
+    selection,
+    onSelectionChange,
+    trace,
+    tracing,
+    status,
+    activePathIndex,
+    onSelectPath,
+    onRun,
+    onClose
+  } = pathTrace;
+  const sourceExists = nodes.some((node) => node.id === selection.sourceNodeId);
+  const targetExists = nodes.some((node) => node.id === selection.targetNodeId);
+  const canRun = sourceExists && targetExists && selection.sourceNodeId !== selection.targetNodeId;
+
+  // 证据节点排在前面，便于选择“起始证据”。
+  const orderedNodes = [...nodes].sort(
+    (a, b) => (a.data.kind === 'evidence' ? 0 : 1) - (b.data.kind === 'evidence' ? 0 : 1)
+  );
+  const nodeOption = (node: Node<ArgumentNodeData>) => (
+    <option key={node.id} value={node.id}>
+      {`【${node.data.kind === 'evidence' ? '证据' : '观点'}】${node.data.label}`}
+    </option>
+  );
+
+  const netSignText =
+    trace === null
+      ? ''
+      : trace.netSign > 0
+        ? '正（整体偏向支持）'
+        : trace.netSign < 0
+          ? '负（整体偏向反驳）'
+          : '零（无路径或正负抵消）';
+
+  return (
+    <section className="panel-card path-card">
+      <div className="sensitivity-heading">
+        <h2>影响路径追踪</h2>
+        {trace && (
+          <button type="button" className="sensitivity-close" onClick={onClose} title="关闭追踪结果">
+            ✕
+          </button>
+        )}
+      </div>
+
+      {nodes.length < 2 ? (
+        <p className="hint">先创建至少两个节点并用连线连接，才能追踪起始证据到目标节点的影响路径。</p>
+      ) : (
+        <>
+          <Field label="起始证据（路径起点）">
+            <select
+              value={selection.sourceNodeId}
+              onChange={(event) => onSelectionChange({ sourceNodeId: event.target.value })}
+            >
+              {!sourceExists && <option value="">请选择起始节点…</option>}
+              {orderedNodes.map(nodeOption)}
+            </select>
+          </Field>
+          <Field label="目标节点">
+            <select
+              value={selection.targetNodeId}
+              onChange={(event) => onSelectionChange({ targetNodeId: event.target.value })}
+            >
+              {!targetExists && <option value="">请选择目标节点…</option>}
+              {orderedNodes.map(nodeOption)}
+            </select>
+          </Field>
+          <Field label={`最大跳数（1–${MAX_PATH_HOPS}）`}>
+            <input
+              type="number"
+              min={1}
+              max={MAX_PATH_HOPS}
+              step={1}
+              value={selection.maxHops}
+              onChange={(event) => onSelectionChange({ maxHops: Number(event.target.value) })}
+            />
+          </Field>
+          <button type="button" className="primary sensitivity-run" disabled={!canRun || tracing} onClick={onRun}>
+            {tracing ? '追踪中…' : '追踪影响路径'}
+          </button>
+          <p className="hint">
+            枚举起点到目标、最多 {MAX_PATH_HOPS} 跳的有向路径；路径分数为逐边有符号边权（支持 +w / 反驳
+            −w）的乘积，遇重复节点立即截断以避免环。只在服务端内存中计算，不会保存图。
+          </p>
+          {status && <p className="sensitivity-status">{status}</p>}
+        </>
+      )}
+
+      {trace && (
+        <div className="path-results">
+          <dl className="decomp-summary path-summary">
+            <dt>枚举路径</dt>
+            <dd>
+              {trace.enumeratedCount} 条{trace.exhaustive ? '' : '（已达上限）'}
+            </dd>
+            <dt>截断分支</dt>
+            <dd>{trace.truncatedCount}</dd>
+            <dt>净符号</dt>
+            <dd className={trace.netSign > 0 ? 'decomp-pos' : trace.netSign < 0 ? 'decomp-neg' : ''}>
+              {netSignText}（{signed(trace.netScore)}）
+            </dd>
+          </dl>
+
+          {trace.paths.length > 0 && (
+            <ol className="path-list">
+              {trace.paths.map((path, index) => (
+                <li key={path.steps.map((step) => step.edgeId).join('|')}>
+                  <button
+                    type="button"
+                    className={`path-item ${index === activePathIndex ? 'active' : ''}`}
+                    onClick={() => onSelectPath(index === activePathIndex ? null : index)}
+                    title={index === activePathIndex ? '再次点击取消画布高亮' : '点击在画布上高亮该路径'}
+                  >
+                    <span className="path-item-head">
+                      <strong>#{index + 1}</strong>
+                      <span className={path.score >= 0 ? 'decomp-pos' : 'decomp-neg'}>{signed(path.score)}</span>
+                      <small>
+                        {path.hops} 跳 · {path.rebutCount} 条反驳
+                      </small>
+                    </span>
+                    <PathChain path={path} nodeLabelById={nodeLabelById} stanceText={stanceText} />
+                  </button>
+                </li>
+              ))}
+            </ol>
+          )}
+
+          <p className="hint">{trace.message}</p>
+          {trace.paths.length > 0 && activePathIndex !== null && (
+            <button type="button" className="path-clear" onClick={() => onSelectPath(null)}>
+              取消画布高亮
+            </button>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** 单条路径的节点链：依次列出节点标签与逐边关系（支持/反驳 + 权重）。 */
+function PathChain({
+  path,
+  nodeLabelById,
+  stanceText
+}: {
+  path: ImpactPath;
+  nodeLabelById: Map<string, string>;
+  stanceText: (stance: Stance) => string;
+}) {
+  const labelOf = (id: string) => nodeLabelById.get(id) ?? id;
+  return (
+    <span className="path-chain">
+      {path.steps.map((step, stepIndex) => (
+        <Fragment key={step.edgeId}>
+          {stepIndex === 0 && <span className="path-node">{labelOf(step.sourceId)}</span>}
+          <span className={`path-step ${step.stance}`}>
+            {stanceText(step.stance)} {Math.round(step.weight * 100)}% →
+          </span>
+          <span className="path-node">{labelOf(step.targetId)}</span>
+        </Fragment>
+      ))}
+    </span>
   );
 }
 

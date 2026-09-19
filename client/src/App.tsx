@@ -14,17 +14,19 @@ import ReactFlow, {
 import 'reactflow/dist/style.css';
 import { api } from './api';
 import { ArgumentNode, nodeTypes, type ArgumentNodeData } from './components/ArgumentNode';
-import { SidePanel, graphToDocument, type SensitivitySelection } from './components/SidePanel';
+import { SidePanel, graphToDocument, type PathTraceSelection, type SensitivitySelection } from './components/SidePanel';
 import { ReplayBar } from './components/ReplayBar';
 import { buildRoundDecomposition } from './replay';
-import type {
-  GraphDocument,
-  GraphNode,
-  GraphEdge,
-  PropagateOptions,
-  PropagateResult,
-  SensitivityResult,
-  Stance
+import {
+  MAX_PATH_HOPS,
+  type GraphDocument,
+  type GraphNode,
+  type GraphEdge,
+  type PathTraceResult,
+  type PropagateOptions,
+  type PropagateResult,
+  type SensitivityResult,
+  type Stance
 } from '../../shared/graph';
 import { stableSample, oscillatingSample } from './samples';
 
@@ -58,15 +60,19 @@ function makeEdge(edge: GraphEdge): Edge {
   };
 }
 
-function decorateEdge(edge: Edge, highlighted: boolean): Edge {
+function decorateEdge(edge: Edge, highlight: { cycle?: boolean; path?: boolean } = {}): Edge {
   const stance = (edge.data?.stance as Stance) ?? 'support';
   const weight = Number(edge.data?.weight ?? 0.6);
+  const classNames = [`stance-${stance}`];
+  if (highlight.cycle) classNames.push('cycle-edge');
+  if (highlight.path) classNames.push('path-edge');
+  const active = Boolean(highlight.cycle || highlight.path);
   return {
     ...edge,
     label: `${stance === 'support' ? '支持' : '反驳'} ${Math.round(weight * 100)}%`,
-    className: `stance-${stance} ${highlighted ? 'cycle-edge' : ''}`,
-    animated: highlighted,
-    style: highlighted ? { strokeWidth: 4 } : undefined,
+    className: classNames.join(' '),
+    animated: active,
+    style: active ? { strokeWidth: 4 } : undefined,
     markerEnd: { type: MarkerType.ArrowClosed }
   };
 }
@@ -119,6 +125,15 @@ export default function App() {
   const [sensitivityResult, setSensitivityResult] = useState<SensitivityResult | null>(null);
   const [sensitivityScanning, setSensitivityScanning] = useState(false);
   const [sensitivityStatus, setSensitivityStatus] = useState('');
+  const [pathSelection, setPathSelection] = useState<PathTraceSelection>({
+    sourceNodeId: '',
+    targetNodeId: '',
+    maxHops: MAX_PATH_HOPS
+  });
+  const [pathTrace, setPathTrace] = useState<PathTraceResult | null>(null);
+  const [pathTracing, setPathTracing] = useState(false);
+  const [pathStatus, setPathStatus] = useState('');
+  const [activePathIndex, setActivePathIndex] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const saveTimerRef = useRef<number | null>(null);
 
@@ -162,22 +177,53 @@ export default function App() {
     setSensitivityStatus('');
   }, []);
 
+  // 图或传播参数的编辑都会使上一次路径追踪结果失效（追踪图与当前画布不再一致）。
+  const invalidatePathTrace = useCallback(() => {
+    setPathTrace(null);
+    setActivePathIndex(null);
+    setPathStatus('');
+  }, []);
+
   const clearAnalysis = useCallback(
     (nextNodes = nodes, nextEdges = edges) => {
       setResult(null);
       setReplayRound(0);
       setPlaying(false);
       invalidateSensitivity();
+      invalidatePathTrace();
       setNodes(
         nextNodes.map((node) => ({
           ...node,
-          data: { ...node.data, displayBelief: undefined, roundDelta: undefined, inCycle: false }
+          data: { ...node.data, displayBelief: undefined, roundDelta: undefined, inCycle: false, inPath: false }
         }))
       );
-      setEdges(nextEdges.map((edge) => decorateEdge({ ...edge, animated: false, style: undefined }, false)));
+      setEdges(nextEdges.map((edge) => decorateEdge({ ...edge, animated: false, style: undefined })));
     },
-    [edges, nodes, setEdges, setNodes, invalidateSensitivity]
+    [edges, nodes, setEdges, setNodes, invalidateSensitivity, invalidatePathTrace]
   );
+
+  const activePath = pathTrace && activePathIndex !== null ? (pathTrace.paths[activePathIndex] ?? null) : null;
+  const cycleEdgeIds = useMemo(() => new Set((result?.cycles ?? []).flatMap((cycle) => cycle.edgeIds)), [result]);
+  const activePathEdgeIds = useMemo(
+    () => new Set((activePath?.steps ?? []).map((step) => step.edgeId)),
+    [activePath]
+  );
+  const activePathNodeIds = useMemo(() => new Set(activePath?.nodeIds ?? []), [activePath]);
+
+  // 统一应用画布高亮：负反馈环（红）与选中的影响路径（蓝）可叠加。
+  useEffect(() => {
+    setEdges((current) =>
+      current.map((edge) =>
+        decorateEdge(edge, { cycle: cycleEdgeIds.has(edge.id), path: activePathEdgeIds.has(edge.id) })
+      )
+    );
+    setNodes((current) =>
+      current.map((node) => {
+        const inPath = activePathNodeIds.has(node.id);
+        return Boolean(node.data.inPath) === inPath ? node : { ...node, data: { ...node.data, inPath } };
+      })
+    );
+  }, [cycleEdgeIds, activePathEdgeIds, activePathNodeIds, setEdges, setNodes]);
 
   const onConnect = useCallback(
     (connection: Connection) => {
@@ -233,7 +279,7 @@ export default function App() {
 
   const updateEdge = (id: string, patch: { weight?: number; stance?: Stance }) => {
     const nextEdges = edges.map((edge) =>
-      edge.id === id ? decorateEdge({ ...edge, data: { ...edge.data, ...patch } }, false) : edge
+      edge.id === id ? decorateEdge({ ...edge, data: { ...edge.data, ...patch } }) : edge
     );
     clearAnalysis(nodes, nextEdges);
     scheduleSave(nodes, nextEdges);
@@ -284,12 +330,11 @@ export default function App() {
       await api.saveGraph(graphToDocument(documentName, nodes, edges));
       const { result: nextResult } = await api.propagate(options);
       const cycleNodeIds = new Set(nextResult.cycles.flatMap((cycle) => cycle.nodeIds));
-      const cycleEdgeIds = new Set(nextResult.cycles.flatMap((cycle) => cycle.edgeIds));
       setResult(nextResult);
       setPlaying(false);
       setReplayRound(nextResult.iterations);
       setNodes((current) => decorateNodesForRound(current, nextResult, nextResult.iterations, cycleNodeIds));
-      setEdges((current) => current.map((edge) => decorateEdge(edge, cycleEdgeIds.has(edge.id))));
+      // 环边高亮由监听 result 的效果统一应用（与路径高亮叠加）。
       setStatus(nextResult.message);
     } catch (error) {
       setStatus(`计算失败：${error instanceof Error ? error.message : String(error)}`);
@@ -350,7 +395,9 @@ export default function App() {
     setReplayRound(0);
     setPlaying(false);
     invalidateSensitivity();
+    invalidatePathTrace();
     setSensitivitySelection({ edgeId: '', targetNodeId: '' });
+    setPathSelection({ sourceNodeId: '', targetNodeId: '', maxHops: MAX_PATH_HOPS });
     if (nextOptions) setOptions(nextOptions);
     if (immediateSave) {
       setStatus('正在导入…');
@@ -438,6 +485,31 @@ export default function App() {
     }
   }, [documentName, edges, nodes, options, sensitivitySelection.edgeId, sensitivitySelection.targetNodeId]);
 
+  const runPathTrace = async () => {
+    if (!pathSelection.sourceNodeId || !pathSelection.targetNodeId) return;
+    setPathTracing(true);
+    setPathStatus('正在服务端内存中枚举有向路径（不保存图）…');
+    try {
+      // 直接提交当前画布：追踪只在服务端内存中进行，不触发任何持久化。
+      const { trace } = await api.tracePaths({
+        graph: graphToDocument(documentName, nodes, edges),
+        sourceNodeId: pathSelection.sourceNodeId,
+        targetNodeId: pathSelection.targetNodeId,
+        maxHops: pathSelection.maxHops
+      });
+      setPathTrace(trace);
+      // 默认高亮绝对影响最大的路径。
+      setActivePathIndex(trace.paths.length > 0 ? 0 : null);
+      setPathStatus(trace.message);
+    } catch (error) {
+      setPathTrace(null);
+      setActivePathIndex(null);
+      setPathStatus(`追踪失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setPathTracing(false);
+    }
+  };
+
   const sensitivityEdgeLabel = useMemo(() => {
     const edge = edges.find((item) => item.id === sensitivitySelection.edgeId);
     if (!edge) return '所选连线';
@@ -459,10 +531,11 @@ export default function App() {
   const handleOptionsChange = useCallback(
     (nextOptions: PropagateOptions) => {
       setOptions(nextOptions);
-      // 扫描沿用当前传播参数：参数一变，旧曲线对应的参数就过期了。
+      // 扫描与路径追踪沿用当前传播参数：参数一变，旧曲线与旧路径就过期了。
       invalidateSensitivity();
+      invalidatePathTrace();
     },
-    [invalidateSensitivity]
+    [invalidateSensitivity, invalidatePathTrace]
   );
 
   return (
@@ -580,6 +653,17 @@ export default function App() {
             onClose: () => setSensitivityResult(null),
             edgeLabel: sensitivityEdgeLabel,
             targetLabel: sensitivityTargetLabel
+          }}
+          pathTrace={{
+            selection: pathSelection,
+            onSelectionChange: (patch) => setPathSelection((current) => ({ ...current, ...patch })),
+            trace: pathTrace,
+            tracing: pathTracing,
+            status: pathStatus,
+            activePathIndex,
+            onSelectPath: setActivePathIndex,
+            onRun: runPathTrace,
+            onClose: invalidatePathTrace
           }}
         />
       </main>

@@ -1,16 +1,27 @@
+# 一键启动：docker compose up --build
+# 访问 http://localhost:8080 （可用 .env 中的 APP_PORT 修改宿主机映射端口，见 .env.example）
 services:
   argument-sandbox:
     build: .
     image: argument-stability-sandbox:latest
     container_name: argument-stability-sandbox
     ports:
+      # 宿主机端口（默认 8080）→ 容器内固定 8080
       - "${APP_PORT:-8080}:8080"
     environment:
       PORT: 8080
       DATABASE_PATH: /app/data/argument.db
     volumes:
+      # SQLite 数据（论证图）持久化到 named volume，容器重建不丢失
       - argument-sqlite-data:/app/data
     restart: unless-stopped
+    # 与 Dockerfile 的 HEALTHCHECK 一致：/api/health 可用即视为健康
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
 
 volumes:
   argument-sqlite-data:
