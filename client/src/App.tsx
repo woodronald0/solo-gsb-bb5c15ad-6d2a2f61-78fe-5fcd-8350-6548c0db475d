@@ -14,21 +14,26 @@ import ReactFlow, {
 import 'reactflow/dist/style.css';
 import { api } from './api';
 import { ArgumentNode, nodeTypes, type ArgumentNodeData } from './components/ArgumentNode';
-import { SidePanel, graphToDocument, type SensitivitySelection } from './components/SidePanel';
+import { SidePanel, graphToDocument, type SensitivitySelection, type TraceSelection } from './components/SidePanel';
 import { ReplayBar } from './components/ReplayBar';
 import { buildRoundDecomposition } from './replay';
 import type {
   GraphDocument,
   GraphNode,
   GraphEdge,
+  InfluencePath,
   PropagateOptions,
   PropagateResult,
   SensitivityResult,
-  Stance
+  Stance,
+  TraceResult
 } from '../../shared/graph';
 import { stableSample, oscillatingSample } from './samples';
 
 const DEFAULT_OPTIONS: PropagateOptions = { threshold: 0.001, maxIterations: 200, lambda: 0.8 };
+const DEFAULT_TRACE_SELECTION: TraceSelection = { startNodeId: '', targetNodeId: '', maxHops: 8 };
+
+type EdgeDecorMode = 'plain' | 'cycle' | 'trace-active';
 
 const documentToFlow = (graph: GraphDocument): { nodes: Node<ArgumentNodeData>[]; edges: Edge[] } => ({
   nodes: graph.nodes.map((node) => ({
@@ -58,15 +63,31 @@ function makeEdge(edge: GraphEdge): Edge {
   };
 }
 
-function decorateEdge(edge: Edge, highlighted: boolean): Edge {
+/** 按当前分析视图重绘连线：追踪优先于负反馈环；选中路径加粗动画，候选路径细线高亮。 */
+function decorateEdge(
+  edge: Edge,
+  mode: EdgeDecorMode,
+  activeRunningScore?: number
+): Edge {
   const stance = (edge.data?.stance as Stance) ?? 'support';
   const weight = Number(edge.data?.weight ?? 0.6);
+  const baseLabel = `${stance === 'support' ? '支持' : '反驳'} ${Math.round(weight * 100)}%`;
+  const className = [
+    `stance-${stance}`,
+    mode === 'cycle' ? 'cycle-edge' : '',
+    mode === 'trace-active' ? 'trace-path-edge trace-active-edge' : ''
+  ]
+    .filter(Boolean)
+    .join(' ');
   return {
     ...edge,
-    label: `${stance === 'support' ? '支持' : '反驳'} ${Math.round(weight * 100)}%`,
-    className: `stance-${stance} ${highlighted ? 'cycle-edge' : ''}`,
-    animated: highlighted,
-    style: highlighted ? { strokeWidth: 4 } : undefined,
+    label:
+      mode === 'trace-active' && activeRunningScore !== undefined
+        ? `${baseLabel} · 累计 ${activeRunningScore >= 0 ? '+' : ''}${activeRunningScore.toFixed(2)}`
+        : baseLabel,
+    className,
+    animated: mode === 'cycle' || mode === 'trace-active',
+    style: mode === 'plain' ? undefined : { strokeWidth: mode === 'trace-active' ? 4.5 : 3.4 },
     markerEnd: { type: MarkerType.ArrowClosed }
   };
 }
@@ -119,6 +140,11 @@ export default function App() {
   const [sensitivityResult, setSensitivityResult] = useState<SensitivityResult | null>(null);
   const [sensitivityScanning, setSensitivityScanning] = useState(false);
   const [sensitivityStatus, setSensitivityStatus] = useState('');
+  const [traceSelection, setTraceSelection] = useState<TraceSelection>(DEFAULT_TRACE_SELECTION);
+  const [traceResult, setTraceResult] = useState<TraceResult | null>(null);
+  const [traceTracing, setTraceTracing] = useState(false);
+  const [traceStatus, setTraceStatus] = useState('');
+  const [traceActiveIndex, setTraceActiveIndex] = useState(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const saveTimerRef = useRef<number | null>(null);
 
@@ -162,21 +188,37 @@ export default function App() {
     setSensitivityStatus('');
   }, []);
 
+  // 图编辑或传播参数编辑都会使追踪路径失效（路径集合与带符号乘积都可能变化）。
+  const invalidateTrace = useCallback(() => {
+    setTraceResult(null);
+    setTraceStatus('');
+    setTraceActiveIndex(0);
+  }, []);
+
   const clearAnalysis = useCallback(
     (nextNodes = nodes, nextEdges = edges) => {
       setResult(null);
       setReplayRound(0);
       setPlaying(false);
       invalidateSensitivity();
+      invalidateTrace();
       setNodes(
         nextNodes.map((node) => ({
           ...node,
-          data: { ...node.data, displayBelief: undefined, roundDelta: undefined, inCycle: false }
+          data: {
+            ...node.data,
+            displayBelief: undefined,
+            roundDelta: undefined,
+            inCycle: false,
+            inTrace: false,
+            traceStart: false,
+            traceTarget: false
+          }
         }))
       );
-      setEdges(nextEdges.map((edge) => decorateEdge({ ...edge, animated: false, style: undefined }, false)));
+      setEdges(nextEdges.map((edge) => decorateEdge({ ...edge, animated: false, style: undefined }, 'plain')));
     },
-    [edges, nodes, setEdges, setNodes, invalidateSensitivity]
+    [edges, nodes, setEdges, setNodes, invalidateSensitivity, invalidateTrace]
   );
 
   const onConnect = useCallback(
@@ -233,7 +275,7 @@ export default function App() {
 
   const updateEdge = (id: string, patch: { weight?: number; stance?: Stance }) => {
     const nextEdges = edges.map((edge) =>
-      edge.id === id ? decorateEdge({ ...edge, data: { ...edge.data, ...patch } }, false) : edge
+      edge.id === id ? decorateEdge({ ...edge, data: { ...edge.data, ...patch } }, 'plain') : edge
     );
     clearAnalysis(nodes, nextEdges);
     scheduleSave(nodes, nextEdges);
@@ -284,12 +326,12 @@ export default function App() {
       await api.saveGraph(graphToDocument(documentName, nodes, edges));
       const { result: nextResult } = await api.propagate(options);
       const cycleNodeIds = new Set(nextResult.cycles.flatMap((cycle) => cycle.nodeIds));
-      const cycleEdgeIds = new Set(nextResult.cycles.flatMap((cycle) => cycle.edgeIds));
+      // 重新计算后，旧的路径追踪高亮不再代表“最近一次分析”，先清空，由统一装饰 effect 回落到环高亮。
+      invalidateTrace();
       setResult(nextResult);
       setPlaying(false);
       setReplayRound(nextResult.iterations);
       setNodes((current) => decorateNodesForRound(current, nextResult, nextResult.iterations, cycleNodeIds));
-      setEdges((current) => current.map((edge) => decorateEdge(edge, cycleEdgeIds.has(edge.id))));
       setStatus(nextResult.message);
     } catch (error) {
       setStatus(`计算失败：${error instanceof Error ? error.message : String(error)}`);
@@ -351,6 +393,8 @@ export default function App() {
     setPlaying(false);
     invalidateSensitivity();
     setSensitivitySelection({ edgeId: '', targetNodeId: '' });
+    invalidateTrace();
+    setTraceSelection(DEFAULT_TRACE_SELECTION);
     if (nextOptions) setOptions(nextOptions);
     if (immediateSave) {
       setStatus('正在导入…');
@@ -461,9 +505,113 @@ export default function App() {
       setOptions(nextOptions);
       // 扫描沿用当前传播参数：参数一变，旧曲线对应的参数就过期了。
       invalidateSensitivity();
+      // 路径分数虽不直接使用传播参数，但追踪与传播视图共用参数语境，参数编辑后一并失效。
+      invalidateTrace();
     },
-    [invalidateSensitivity]
+    [invalidateSensitivity, invalidateTrace]
   );
+
+  const runTrace = useCallback(async () => {
+    if (!traceSelection.startNodeId || !traceSelection.targetNodeId) return;
+    setTraceTracing(true);
+    setTraceStatus('正在服务端枚举有向简单路径（不保存图）…');
+    try {
+      // 直接提交当前画布：追踪只在服务端内存中枚举，不触发任何持久化。
+      const { trace } = await api.traceInfluence({
+        graph: graphToDocument(documentName, nodes, edges),
+        startNodeId: traceSelection.startNodeId,
+        targetNodeId: traceSelection.targetNodeId,
+        maxHops: traceSelection.maxHops
+      });
+      setTraceResult(trace);
+      setTraceActiveIndex(0);
+      setTraceStatus(trace.message);
+    } catch (error) {
+      setTraceResult(null);
+      setTraceStatus(`追踪失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setTraceTracing(false);
+    }
+  }, [
+    documentName,
+    edges,
+    nodes,
+    traceSelection.maxHops,
+    traceSelection.startNodeId,
+    traceSelection.targetNodeId
+  ]);
+
+  // 当前要在画布上高亮的路径（追踪结果中的第 activeIndex 条）。
+  const activeTracePath: InfluencePath | null = useMemo(() => {
+    if (!traceResult || traceResult.paths.length === 0) return null;
+    const index = Math.max(0, Math.min(traceActiveIndex, traceResult.paths.length - 1));
+    return traceResult.paths[index] ?? null;
+  }, [traceResult, traceActiveIndex]);
+
+  // 起点或目标节点被删除后，清掉失效追踪选择。
+  useEffect(() => {
+    setTraceSelection((current) => {
+      const startExists =
+        !current.startNodeId || nodes.some((node) => node.id === current.startNodeId && node.data.kind === 'evidence');
+      const targetExists = !current.targetNodeId || nodes.some((node) => node.id === current.targetNodeId);
+      if (startExists && targetExists) return current;
+      return {
+        startNodeId: startExists ? current.startNodeId : '',
+        targetNodeId: targetExists ? current.targetNodeId : '',
+        maxHops: current.maxHops
+      };
+    });
+  }, [nodes]);
+
+  // 追踪高亮（优先）/负反馈环高亮 / 无高亮：由最近一次分析结果统一驱动，保证连线样式幂等。
+  const cycleEdgeIds = useMemo(
+    () => new Set((result?.cycles ?? []).flatMap((cycle) => cycle.edgeIds)),
+    [result]
+  );
+  useEffect(() => {
+    setEdges((current) =>
+      current.map((edge) => {
+        if (activeTracePath) {
+          const stepIndex = activeTracePath.edgeIds.indexOf(edge.id);
+          if (stepIndex >= 0) {
+            return decorateEdge(edge, 'trace-active', activeTracePath.steps[stepIndex]?.runningScore);
+          }
+          return decorateEdge(edge, 'plain');
+        }
+        if (result) return decorateEdge(edge, cycleEdgeIds.has(edge.id) ? 'cycle' : 'plain');
+        return decorateEdge(edge, 'plain');
+      })
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTracePath, result, cycleEdgeIds]);
+
+  // 节点上的追踪标记（起点/目标/途经）；不动可信度着色，回放与追踪可以同时可见。
+  useEffect(() => {
+    if (!activeTracePath) {
+      setNodes((current) => {
+        if (current.every((node) => !node.data.inTrace && !node.data.traceStart && !node.data.traceTarget)) {
+          return current;
+        }
+        return current.map((node) => ({
+          ...node,
+          data: { ...node.data, inTrace: false, traceStart: false, traceTarget: false }
+        }));
+      });
+      return;
+    }
+    const traceNodeIds = new Set(activeTracePath.nodeIds);
+    setNodes((current) =>
+      current.map((node) => ({
+        ...node,
+        data: {
+          ...node.data,
+          inTrace: traceNodeIds.has(node.id),
+          traceStart: node.id === activeTracePath.nodeIds[0],
+          traceTarget: node.id === activeTracePath.nodeIds[activeTracePath.nodeIds.length - 1]
+        }
+      }))
+    );
+  }, [activeTracePath, setNodes]);
 
   return (
     <div className="app-shell">
@@ -518,6 +666,20 @@ export default function App() {
             onNodeClick={(_event, node) => {
               setSelectedNodeId(node.id);
               setSelectedEdgeId(null);
+              // 点击证据自动设为追踪起点，点击观点自动设为追踪目标，减少手动选择。
+              if (node.data.kind === 'evidence') {
+                setTraceSelection((current) => ({
+                  ...current,
+                  startNodeId: node.id,
+                  targetNodeId: current.targetNodeId === node.id ? '' : current.targetNodeId
+                }));
+              } else {
+                setTraceSelection((current) => ({
+                  ...current,
+                  targetNodeId: node.id,
+                  startNodeId: current.startNodeId === node.id ? '' : current.startNodeId
+                }));
+              }
             }}
             onEdgeClick={(_event, edge) => {
               setSelectedEdgeId(edge.id);
@@ -580,6 +742,19 @@ export default function App() {
             onClose: () => setSensitivityResult(null),
             edgeLabel: sensitivityEdgeLabel,
             targetLabel: sensitivityTargetLabel
+          }}
+          trace={{
+            selection: traceSelection,
+            onSelectionChange: (patch) => setTraceSelection((current) => ({ ...current, ...patch })),
+            result: traceResult,
+            tracing: traceTracing,
+            status: traceStatus,
+            activeIndex: activeTracePath
+              ? Math.max(0, Math.min(traceActiveIndex, traceResult?.paths.length ?? 1))
+              : 0,
+            onActiveIndexChange: setTraceActiveIndex,
+            onRun: runTrace,
+            onClose: invalidateTrace
           }}
         />
       </main>

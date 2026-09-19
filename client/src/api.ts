@@ -2,7 +2,8 @@ import type {
   GraphDocument,
   PropagateOptions,
   PropagateResult,
-  SensitivityResult
+  SensitivityResult,
+  TraceResult
 } from '../../shared/graph';
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -35,6 +36,17 @@ export const api = {
     samples?: number;
   }) =>
     request<{ scan: SensitivityResult }>('/api/sensitivity/edge-weight', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    }),
+  /** 影响路径追踪：提交当前画布图，枚举至多 8 跳有向简单路径，仅在服务端内存中计算，不会保存图。 */
+  traceInfluence: (payload: {
+    graph: GraphDocument;
+    startNodeId: string;
+    targetNodeId: string;
+    maxHops?: number;
+  }) =>
+    request<{ trace: TraceResult }>('/api/trace/influence-paths', {
       method: 'POST',
       body: JSON.stringify(payload)
     })

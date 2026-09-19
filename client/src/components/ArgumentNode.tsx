@@ -12,6 +12,12 @@ export interface ArgumentNodeData {
   /** 相对上一轮的升降（第 0 轮为空） */
   roundDelta?: number;
   inCycle?: boolean;
+  /** 位于当前高亮的影响路径上 */
+  inTrace?: boolean;
+  /** 当前高亮路径的起点（起始证据） */
+  traceStart?: boolean;
+  /** 当前高亮路径的终点（目标节点） */
+  traceTarget?: boolean;
   [key: string]: unknown;
 }
 
@@ -30,6 +36,9 @@ export function ArgumentNode({ data, selected }: NodeProps<ArgumentNodeData>) {
         `kind-${data.kind}`,
         selected ? 'selected' : '',
         data.inCycle ? 'in-cycle' : '',
+        data.inTrace ? 'in-trace' : '',
+        data.traceStart ? 'trace-start' : '',
+        data.traceTarget ? 'trace-target' : '',
         data.anchored ? 'anchored' : ''
       ].join(' ')}
       style={colors ? { backgroundImage: `linear-gradient(${colors.tint}, ${colors.tint})` } : undefined}
@@ -37,7 +46,23 @@ export function ArgumentNode({ data, selected }: NodeProps<ArgumentNodeData>) {
       <Handle type="target" position={Position.Left} />
       <div className="node-heading">
         <span className="node-kind">{data.kind === 'evidence' ? '证据' : '观点'}</span>
-        {data.anchored && <span className="anchor-badge" title="传播中固定为先验可信度">固定</span>}
+        <span className="node-badges">
+          {data.traceStart && (
+            <span className="trace-badge trace-badge-start" title="影响路径追踪起点">
+              起点
+            </span>
+          )}
+          {data.traceTarget && (
+            <span className="trace-badge trace-badge-target" title="影响路径追踪目标">
+              目标
+            </span>
+          )}
+          {data.anchored && (
+            <span className="anchor-badge" title="传播中固定为先验可信度">
+              固定
+            </span>
+          )}
+        </span>
       </div>
       <div className="node-label">{data.label}</div>
       <div className="belief-row">

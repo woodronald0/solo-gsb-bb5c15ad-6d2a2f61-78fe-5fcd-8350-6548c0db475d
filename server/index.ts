@@ -10,6 +10,7 @@ import {
   validateSamples,
   validateSensitivitySelection
 } from './sensitivity.js';
+import { traceInfluencePaths, validateMaxHops, validateTraceSelection } from './trace.js';
 
 const currentDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(currentDir, '../..');
@@ -74,6 +75,23 @@ app.post('/api/sensitivity/edge-weight', (request, response) => {
     response.json({ scan });
   } catch (error) {
     response.status(400).json({ error: error instanceof Error ? error.message : '敏感性扫描请求无效。' });
+  }
+});
+
+// 影响路径追踪：使用请求体携带的当前画布图，在内存中枚举至多 8 跳简单路径，绝不保存或修改持久化图。
+app.post('/api/trace/influence-paths', (request, response) => {
+  try {
+    const candidate = request.body?.graph;
+    if (candidate === undefined || candidate === null) {
+      throw new Error('请求体必须携带当前图 graph（追踪不会保存该图）。');
+    }
+    const graph = validateGraphDocument(candidate);
+    validateTraceSelection(graph, request.body?.startNodeId, request.body?.targetNodeId);
+    const maxHops = validateMaxHops(request.body?.maxHops);
+    const trace = traceInfluencePaths(graph, request.body.startNodeId, request.body.targetNodeId, maxHops);
+    response.json({ trace });
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : '影响路径追踪请求无效。' });
   }
 });
 

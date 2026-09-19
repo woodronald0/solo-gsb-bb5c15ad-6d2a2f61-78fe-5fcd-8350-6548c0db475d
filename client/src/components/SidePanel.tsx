@@ -5,10 +5,12 @@ import { SensitivityChart } from './SensitivityChart';
 import type {
   GraphDocument,
   NodeKind,
+  PathSign,
   PropagateOptions,
   PropagateResult,
   SensitivityResult,
-  Stance
+  Stance,
+  TraceResult
 } from '../../../shared/graph';
 
 export interface SelectionState {
@@ -19,6 +21,12 @@ export interface SelectionState {
 export interface SensitivitySelection {
   edgeId: string;
   targetNodeId: string;
+}
+
+export interface TraceSelection {
+  startNodeId: string;
+  targetNodeId: string;
+  maxHops: number;
 }
 
 interface SidePanelProps {
@@ -40,6 +48,17 @@ interface SidePanelProps {
     onClose: () => void;
     edgeLabel: string;
     targetLabel: string;
+  };
+  trace: {
+    selection: TraceSelection;
+    onSelectionChange: (patch: Partial<TraceSelection>) => void;
+    result: TraceResult | null;
+    tracing: boolean;
+    status: string;
+    activeIndex: number;
+    onActiveIndexChange: (index: number) => void;
+    onRun: () => void;
+    onClose: () => void;
   };
   nodes: Node<ArgumentNodeData>[];
   edges: Edge[];
@@ -172,6 +191,7 @@ export function SidePanel({
   onUpdateEdge,
   onDeleteSelection,
   sensitivity,
+  trace,
   nodes,
   edges
 }: SidePanelProps) {
@@ -292,6 +312,8 @@ export function SidePanel({
         stanceText={stanceText}
       />
 
+      <TraceCard trace={trace} nodes={nodes} nodeLabelById={nodeLabelById} stanceText={stanceText} />
+
       {decomposition && selection.node && <DecompositionCard decomposition={decomposition} />}
 
       {result && (
@@ -411,7 +433,159 @@ function SensitivityCard({ sensitivity, nodes, edges, nodeLabelById, stanceText 
   );
 }
 
-export function graphToDocument(name: string, nodes: Node<ArgumentNodeData>[], edges: Edge[]): GraphDocument {  return {
+type TraceCardProps = Pick<SidePanelProps, 'trace' | 'nodes'> & {
+  nodeLabelById: Map<string, string>;
+  stanceText: (stance: Stance) => string;
+};
+
+const HOP_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8];
+
+/** 影响路径追踪卡片：选择起始证据与目标节点，枚举至多 8 跳路径，按 |带符号边权乘积| 取前 3 条。 */
+function TraceCard({ trace, nodes, nodeLabelById, stanceText }: TraceCardProps) {
+  const { selection, onSelectionChange, result, tracing, status, activeIndex, onActiveIndexChange, onRun, onClose } =
+    trace;
+  const evidenceNodes = nodes.filter((node) => node.data.kind === 'evidence');
+  const startExists = evidenceNodes.some((node) => node.id === selection.startNodeId);
+  const targetExists = nodes.some((node) => node.id === selection.targetNodeId);
+  const canRun =
+    startExists && targetExists && selection.startNodeId !== selection.targetNodeId && selection.maxHops >= 1;
+
+  const signMeta: Record<PathSign, { text: string; className: string }> = {
+    support: { text: '净支持', className: 'trace-sign support' },
+    rebut: { text: '净反驳', className: 'trace-sign rebut' }
+  };
+
+  return (
+    <section className="panel-card trace-card">
+      <div className="sensitivity-heading">
+        <h2>影响路径追踪</h2>
+        {result && (
+          <button type="button" className="sensitivity-close" onClick={onClose} title="关闭追踪结果">
+            ✕
+          </button>
+        )}
+      </div>
+
+      {nodes.length === 0 ? (
+        <p className="hint">先创建节点（至少一个证据节点）与连线，才能追踪证据对目标的影响路径。</p>
+      ) : (
+        <>
+          <Field label="起始证据（路径从该证据出发）">
+            <select
+              value={startExists ? selection.startNodeId : ''}
+              onChange={(event) => onSelectionChange({ startNodeId: event.target.value })}
+            >
+              {!startExists && <option value="">请选择证据节点…</option>}
+              {evidenceNodes.map((node) => (
+                <option key={node.id} value={node.id}>
+                  {node.data.label}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="目标节点（路径抵达该节点）">
+            <select
+              value={targetExists ? selection.targetNodeId : ''}
+              onChange={(event) => onSelectionChange({ targetNodeId: event.target.value })}
+            >
+              {!targetExists && <option value="">请选择目标节点…</option>}
+              {nodes
+                .filter((node) => node.id !== selection.startNodeId)
+                .map((node) => (
+                  <option key={node.id} value={node.id}>
+                    {node.data.label}
+                  </option>
+                ))}
+            </select>
+          </Field>
+          <Field label="最大跳数（遇到重复节点立即截断）">
+            <select
+              value={selection.maxHops}
+              onChange={(event) => onSelectionChange({ maxHops: Number(event.target.value) })}
+            >
+              {HOP_OPTIONS.map((hops) => (
+                <option key={hops} value={hops}>
+                  {hops} 跳
+                </option>
+              ))}
+            </select>
+          </Field>
+          <button type="button" className="primary sensitivity-run" disabled={!canRun || tracing} onClick={onRun}>
+            {tracing ? '追踪中…' : '运行路径追踪'}
+          </button>
+          <p className="hint">在画布上点击证据节点会自动设为起点、点击观点节点自动设为目标。追踪只在服务端内存中枚举，不会保存或改动当前图。</p>
+          {status && <p className="sensitivity-status">{status}</p>}
+        </>
+      )}
+
+      {result && (
+        <div className="trace-result">
+          <p className="hint">{result.message}</p>
+          {result.paths.length === 0 ? (
+            <p className="hint">
+              从「{nodeLabelById.get(result.startNodeId) ?? result.startNodeId}」到「
+              {nodeLabelById.get(result.targetNodeId) ?? result.targetNodeId}」在 {result.maxHops} 跳内无可达路径。
+            </p>
+          ) : (
+            <ol className="trace-path-list">
+              {result.paths.map((path, index) => (
+                <li key={path.edgeIds.join('-')}>
+                  <button
+                    type="button"
+                    className={`trace-path-item ${index === activeIndex ? 'active' : ''} trace-${path.sign}`}
+                    onClick={() => onActiveIndexChange(index)}
+                  >
+                    <span className="trace-path-head">
+                      <span className="trace-rank">#{index + 1}</span>
+                      <span className={signMeta[path.sign].className}>{signMeta[path.sign].text}</span>
+                      <strong className={path.score >= 0 ? 'decomp-pos' : 'decomp-neg'}>
+                        {path.score >= 0 ? '+' : ''}
+                        {path.score.toFixed(4)}
+                      </strong>
+                    </span>
+                    <small>
+                      {path.hops} 跳 · {path.rebutCount} 条反驳 · |分数| {path.absoluteScore.toFixed(4)}
+                      {result.truncated ? ' · 枚举已截断' : ''}
+                    </small>
+                    <span className="trace-chain">
+                      {path.nodeIds.map((id, nodeIndex) => (
+                        <span key={`${id}-${nodeIndex}`} className="trace-chain-node">
+                          {nodeIndex > 0 && (
+                            <>
+                              <em
+                                className={`trace-chain-edge stance-text-${path.steps[nodeIndex - 1].stance}`}
+                                title={`第 ${nodeIndex} 跳：${stanceText(path.steps[nodeIndex - 1].stance)} 边权 ${path.steps[nodeIndex - 1].weight}，截至本跳累计带符号乘积 ${path.steps[nodeIndex - 1].runningScore.toFixed(4)}`}
+                              >
+                                {stanceText(path.steps[nodeIndex - 1].stance)}{' '}
+                                {Math.round(path.steps[nodeIndex - 1].weight * 100)}%
+                              </em>
+                              <small className="trace-chain-score">
+                                {path.steps[nodeIndex - 1].runningScore >= 0 ? '+' : ''}
+                                {path.steps[nodeIndex - 1].runningScore.toFixed(2)}
+                              </small>
+                            </>
+                          )}
+                          <span className="trace-chain-label">
+                            {nodeIndex === 0 && '🟢 '}
+                            {nodeIndex === path.nodeIds.length - 1 && '🎯 '}
+                            {nodeLabelById.get(id) ?? id}
+                          </span>
+                        </span>
+                      ))}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ol>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+export function graphToDocument(name: string, nodes: Node<ArgumentNodeData>[], edges: Edge[]): GraphDocument {
+  return {
     version: 1,
     name,
     nodes: nodes.map((node) => ({
